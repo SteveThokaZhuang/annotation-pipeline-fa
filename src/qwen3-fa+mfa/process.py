@@ -1,4 +1,4 @@
-"""Run Qwen on GPU, then repair complete zero-duration sentences with MFA."""
+"""Run Qwen, then CPU MFA chunk repair with midpoint sentence fallback."""
 from pathlib import Path
 import sys
 
@@ -16,9 +16,12 @@ def main():
     p.add_argument('--mfa-jobs', type=int, default=8)
     p.add_argument('--mfa-timeout', type=int, default=1800)
     p.add_argument('--padding', type=float, default=0.35)
+    p.add_argument('--mfa-seam-policy', choices=['midpoint', 'clamp', 'bounded'], default='midpoint')
+    p.add_argument('--mfa-repair-scope', choices=['sentence', 'chunk'], default='chunk')
+    p.add_argument('--no-mfa-sentence-fallback', action='store_false', dest='mfa_sentence_fallback', default=True)
     args = p.parse_args()
     for path in [args.mfa_python, args.dictionary, args.acoustic_model]:
-        if not path.exists():
+        if not path.exists() and args.complex_handling == 'off':
             p.error('Missing MFA dependency: '+str(path))
     if args.padding < 0 or args.mfa_jobs < 1:
         p.error('padding must be nonnegative; mfa-jobs must be positive')

@@ -54,6 +54,44 @@ class NyraRepair:
         self.args = args
         self.aligner = aligner
         self._nyra_model = None
+        self._nyra_load_error = None
+
+    def _load_model(self):
+        if self._nyra_model is not None:
+            return self._nyra_model, 0.0
+        if self._nyra_load_error:
+            raise RuntimeError('Nyra model loading previously failed: '+self._nyra_load_error)
+        started = time.perf_counter()
+        try:
+            configure_nyra(self.args)
+            from nyra_align import Aligner
+            model = Aligner(model=self.args.nyra_checkpoint, device=self.args.device, precision='fp32')
+            _ = model.wavlm
+            if self.args.device.startswith('cuda'):
+                self.aligner.torch.cuda.synchronize()
+        except Exception as exc:
+            self._nyra_load_error = repr(exc)
+            raise
+        self._nyra_model = model
+        return model, time.perf_counter()-started
+
+    def shadow_candidate(self, task):
+        """Produce a checked lexical candidate without modifying any main row."""
+        model, loaded = self._load_model()
+        started = time.perf_counter()
+        result = model.align(task['crop_audio'], nyra_text(task['original_words']))
+        if self.args.device.startswith('cuda'):
+            self.aligner.torch.cuda.synchronize()
+        raw = dict(raw_words=[dict(text=w.word, start=float(w.start), end=float(w.end), type=w.type)
+                              for w in result.words], skipped=result.skipped,
+                   model_load_seconds=loaded, inference_seconds=time.perf_counter()-started)
+        # Keep raw rejected results for diagnosis, including skipped input tokens.
+        try:
+            raw['candidate_words'] = nyra_candidate(task['original_words'], result, task['crop_start'])
+        except ValueError as exc:
+            raw['candidate_words'] = []
+            raw['alignment_error'] = str(exc)
+        return raw
 
     def repair(self, predictions):
         started = time.perf_counter()
@@ -64,9 +102,12 @@ class NyraRepair:
             after_mfa = audit(predictions)
             write_jsonl(self.args.output/'mfa_predictions.jsonl', predictions)
             write_json(self.args.output/'mfa_error_stats.json', after_mfa)
-            # Preserve exactly the rejected complete sentence groups and crops.
+            # Reuse rejected groups/crops, auditing against current post-MFA times.
             tasks = [r for r in read_jsonl(self.args.output/'mfa/repairs.jsonl') if r['status']=='unresolved']
+            current={r['id']:r for r in predictions}
             for task in tasks:
+                task['mfa_original_words']=task['original_words']
+                task['original_words']=[dict(w) for w in current[task['id']]['words'][task['start_index']:task['end_index']]]
                 task['mfa_rejection_reason'] = task.pop('reason')
                 task.pop('status')
                 task['crop_audio'] = str((self.args.output/'mfa/corpus'/(task['task_id']+'.wav')).resolve())
@@ -78,25 +119,49 @@ class NyraRepair:
             root = self.args.output/'nyra'
             root.mkdir()
             tasks, unresolved = prepare_sentence_tasks(predictions, root, self.args.padding,
-                                                       getattr(self.args, 'audio_loader', None))
+                getattr(self.args, 'audio_loader', None),
+                task_guard=(self.args.complex_handler.baseline_rejection
+                            if getattr(self.args, 'complex_handler', None) else None), backend='nyra')
             for task in tasks:
                 task['crop_audio'] = str((root/'corpus'/(task['task_id']+'.wav')).resolve())
+            write_jsonl(root/'tasks.jsonl', tasks)
+        if getattr(self.args, 'complex_handler', None):
+            for task in tasks:
+                row = predictions[task['row_index']]
+                rejection = self.args.complex_handler.baseline_rejection(row, 'nyra')
+                if rejection:
+                    task['preparation_error'] = rejection
+                elif task.get('preparation_error', '').startswith('unsupported_language:mfa:'):
+                    # MFA may have been deliberately disabled or use another language.
+                    # Its guard creates no crop; make one only after the Nyra gate passes.
+                    try:
+                        import math
+                        import soundfile as sf
+                        from complex_handling.audio import SelectedAudio
+                        audio, sr = SelectedAudio(row, getattr(self.args, 'audio_loader', None))()
+                        words = task['original_words']
+                        start = max(0, math.floor((min(w['start'] for w in words)-row['chunk_start']-self.args.padding)*sr))
+                        end = min(len(audio), math.ceil((max(w['end'] for w in words)-row['chunk_start']+self.args.padding)*sr))
+                        if end <= start:
+                            raise ValueError('Empty sentence crop after MFA language skip')
+                        (root/'corpus').mkdir(exist_ok=True)
+                        crop = root/'corpus'/(task['task_id']+'.wav')
+                        sf.write(crop, audio[start:end], sr, subtype='PCM_16')
+                        task.update(crop_audio=str(crop.resolve()), crop_start=row['chunk_start']+start/sr,
+                                    crop_end=row['chunk_start']+end/sr)
+                        task.pop('preparation_error')
+                    except Exception as exc:
+                        task['preparation_error'] = repr(exc)
             write_jsonl(root/'tasks.jsonl', tasks)
         print(f'Nyra: {len(tasks)} complete sentence groups requested', flush=True)
         accepted, rejected, raw_results = [], [], []
         model = self._nyra_model
         load_seconds = inference_seconds = 0.0
         load_error = None
-        if tasks and model is None:
+        if any(not t.get('preparation_error') for t in tasks) and model is None:
             load_started = time.perf_counter()
             try:
-                configure_nyra(self.args)
-                from nyra_align import Aligner
-                model = Aligner(model=self.args.nyra_checkpoint, device=self.args.device, precision='fp32')
-                _ = model.wavlm  # Include lazy WavLM loading in startup time.
-                if self.args.device.startswith('cuda'):
-                    self.aligner.torch.cuda.synchronize()
-                self._nyra_model = model
+                model, _ = self._load_model()
             except Exception as exc:
                 load_error = repr(exc)
             load_seconds = time.perf_counter()-load_started
@@ -172,11 +237,17 @@ def run_nyra_mode(method):
     p.add_argument('--acoustic-model', type=Path, default=ROOT/'models/mfa-english/english_us_arpa.zip')
     p.add_argument('--mfa-jobs', type=int, default=8)
     p.add_argument('--mfa-timeout', type=int, default=1800)
+    p.add_argument('--mfa-repair-scope', choices=['sentence','chunk'], default='chunk')
+    p.add_argument('--mfa-seam-policy', choices=['midpoint','clamp','bounded'], default='midpoint')
+    p.add_argument('--no-mfa-sentence-fallback', action='store_false',dest='mfa_sentence_fallback',default=True)
     args = p.parse_args()
     args.method = method
     required = [args.nyra_checkpoint/'model.npz', args.nyra_checkpoint/'wavlm/model.safetensors']
     if method == 'qwen+mfa+nyra':
         required.extend([args.mfa_python,args.dictionary,args.acoustic_model])
+    # With language gates active, non-English jobs do not require Nyra weights.
+    if getattr(args, 'complex_handling', 'off') != 'off':
+        required = []
     for path in required:
         if not path.exists():
             p.error('Missing local model/dependency: '+str(path))

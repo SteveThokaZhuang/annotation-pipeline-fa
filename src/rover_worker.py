@@ -23,6 +23,7 @@ from repair import SentenceRepair
 from nyra_repair import NyraRepair
 from prediction_format import FORMAT, export_json, write_predictions
 from compare_results import validate_repairs
+from complex_handling import ComplexHandler, add_arguments as add_complex_arguments
 
 
 class Totals:
@@ -126,7 +127,7 @@ def archive_block(scratch,destination,rows):
                                       channel=row['channel'],chunk_start_sample=row['start_sample'])
                     record.pop('crop_audio',None)
                     output.write(json.dumps(record,ensure_ascii=False,allow_nan=False)+'\n')
-        for name in ['runtime.json','mfa.log']:
+        for name in ['runtime.json','mfa.log','chunk_attempts.jsonl','cross_chunk_seams.jsonl','cross_chunk_rejected.jsonl']:
             source=scratch/backend/name
             if source.exists():shutil.copyfile(source,out/name)
         aligned=scratch/backend/'aligned'
@@ -134,6 +135,22 @@ def archive_block(scratch,destination,rows):
             with gzip.open(out/'raw_alignments.jsonl.gz','wt',compresslevel=1) as archive:
                 for path in sorted(aligned.rglob('*.json')):
                     archive.write(json.dumps(dict(task_id=path.stem,alignment=json.loads(path.read_text())),ensure_ascii=False)+'\n')
+        fallback=scratch/backend/'sentence_fallback'
+        if fallback.exists():
+            target=out/'sentence_fallback';target.mkdir()
+            if (fallback/'unresolved.json').exists():shutil.copyfile(fallback/'unresolved.json',target/'unresolved.json')
+            stage=fallback/'mfa';stage_out=target/'mfa';stage_out.mkdir()
+            for name in ['tasks.jsonl','repairs.jsonl','runtime.json','mfa.log']:
+                if (stage/name).exists():shutil.copyfile(stage/name,stage_out/name)
+            with gzip.open(stage_out/'raw_alignments.jsonl.gz','wt',compresslevel=1) as archive:
+                for path in sorted((stage/'aligned').rglob('*.json')):
+                    archive.write(json.dumps(dict(task_id=path.stem,alignment=json.loads(path.read_text())),ensure_ascii=False)+'\n')
+    complex_root=scratch/'complex_handling'
+    if complex_root.exists():
+        target=destination/'complex_handling';target.mkdir()
+        for source in complex_root.iterdir():
+            if source.is_file() and source.suffix in ('.json','.jsonl'):
+                shutil.copyfile(source,target/source.name)
     unresolved=json.loads((scratch/'unresolved.json').read_text())
     for record in unresolved['rejected_sentences']:
         row=by_id.get(record['id'])
@@ -151,13 +168,18 @@ def main():
     p.add_argument('--method',choices=['qwen+mfa+nyra','qwen+mfa','qwen+nyra'],required=True)
     p.add_argument('--batch-size',type=int,default=128);p.add_argument('--block-size',type=int,default=32768)
     p.add_argument('--mfa-jobs',type=int,default=32);p.add_argument('--limit',type=int)
+    p.add_argument('--mfa-seam-policy',choices=['midpoint','clamp','bounded'],default='midpoint')
+    p.add_argument('--mfa-repair-scope',choices=['sentence','chunk'],default='chunk')
+    p.add_argument('--no-mfa-sentence-fallback',action='store_false',dest='mfa_sentence_fallback',default=True)
     p.add_argument('--export-unit',choices=['chunk','audio','both'],help='Also export individual JSON files after all blocks')
+    add_complex_arguments(p)
     a=p.parse_args()
     a.device='cuda:0';a.padding=.35;a.mfa_timeout=14400
     a.mfa_python=ROOT/'models/mfa/bin/python';a.acoustic_model=ROOT/'models/mfa-english/english_us_arpa.zip'
     a.dictionary=ROOT/'models/mfa-english/dictionary/english_us_arpa.dict'
     a.nyra_runtime=ROOT/'models/nyra';a.nyra_espeak=ROOT/'models/nyra-espeak'
     a.nyra_checkpoint=ROOT/'models/nyra-forced-aligner/checkpoints'
+    complex_handler=ComplexHandler.from_args(a)
     output=a.output;output.mkdir(parents=True,exist_ok=False);a.scratch.mkdir(parents=True,exist_ok=True)
     import torch
     torch.set_num_threads(4)
@@ -204,6 +226,7 @@ def main():
                         value=dict(row,method=a.method,backend='public',language=lang,
                             words=[dict(w,source='qwen') for w in words],
                             sentences=sentence_spans(row['text'],lang,aligner.model.aligner_processor))
+                        if complex_handler:value['input_language']=row.get('input_language',row.get('language'))
                         if row['id'] in failed_by_id:value['error']=failed_by_id[row['id']]
                         predictions.append(value)
                     if (offset//a.batch_size+1)%32==0:print(f'Qwen block={blocks} chunks={processed+offset+len(batch)}',flush=True)
@@ -216,6 +239,7 @@ def main():
                                                   separators=(',',':'),allow_nan=False)+'\n').encode())
                 original=copy.deepcopy(predictions);write_jsonl(scratch/'qwen_predictions.jsonl',predictions)
                 a.output=scratch;a.audio_loader=lambda row:(cache[row['id']][:,None],16000)
+                if complex_handler:complex_handler.prepare(predictions,a.audio_loader)
                 repair_started=time.perf_counter()
                 route=SentenceRepair(a,aligner).repair(predictions) if a.method=='qwen+mfa' else engine.repair(predictions)
                 repair_seconds=time.perf_counter()-repair_started
@@ -226,13 +250,15 @@ def main():
                 if a.method=='qwen+mfa':
                     totals['mfa'].add(after)
                     validation['mfa']=validate_repairs(original,predictions,read_jsonl(scratch/'mfa/repairs.jsonl'),
-                        json.loads((scratch/'unresolved.json').read_text()))
+                        json.loads((scratch/'unresolved.json').read_text()),
+                        cross_chunk_seams=read_jsonl(scratch/'mfa/cross_chunk_seams.jsonl') if (scratch/'mfa/cross_chunk_seams.jsonl').exists() else [])
                     route_counts['mfa_requested']+=route['sentence_groups'];route_counts['mfa_accepted']+=route['accepted_groups']
                     phase_seconds['mfa_command_seconds']+=route['mfa_command_seconds']
                 elif a.method=='qwen+mfa+nyra':
                     intermediate=read_jsonl(scratch/'mfa_predictions.jsonl');totals['mfa'].add(statistics(intermediate))
                     validation['mfa']=validate_repairs(original,intermediate,read_jsonl(scratch/'mfa/repairs.jsonl'),
-                        json.loads((scratch/'mfa/unresolved.json').read_text()))
+                        json.loads((scratch/'mfa/unresolved.json').read_text()),
+                        cross_chunk_seams=read_jsonl(scratch/'mfa/cross_chunk_seams.jsonl') if (scratch/'mfa/cross_chunk_seams.jsonl').exists() else [])
                     validation['nyra']=validate_repairs(intermediate,predictions,read_jsonl(scratch/'nyra/repairs.jsonl'),
                         json.loads((scratch/'unresolved.json').read_text()),source='nyra')
                     route_counts['mfa_requested']+=route['mfa']['sentence_groups'];route_counts['mfa_accepted']+=route['mfa']['accepted_groups']
@@ -244,6 +270,12 @@ def main():
                     route_counts['nyra_requested']+=route['sentence_groups'];route_counts['nyra_accepted']+=route['accepted_groups']
                     phase_seconds['nyra_model_load_seconds']+=route['nyra_model_load_seconds']
                     phase_seconds['nyra_inference_seconds']+=route['nyra_inference_seconds']
+                if complex_handler:
+                    complex_stats=complex_handler.run(predictions,scratch,audio_loader=a.audio_loader,
+                        aligner=aligner,args=a,nyra_engine=engine)
+                    route['complex_handling']=complex_stats
+                    phase_seconds['complex_handling_seconds']+=complex_stats['seconds']
+                    phase_seconds['nyra_model_load_seconds']+=complex_stats['nyra_model_load_seconds']
                 write_json(scratch/'validation.json',validation);write_predictions(scratch,predictions)
                 write_jsonl(scratch/'failures.jsonl',failed);write_json(scratch/'error_stats.json',dict(before=before,after=after,repair=route))
                 block_duration=sum(r['duration'] for r in rows)
@@ -263,6 +295,7 @@ def main():
         exported=export_json(output,(row for path in sorted((output/'blocks').glob('b*/predictions.jsonl'))
                                     for row in read_jsonl(path)),a.export_unit)
     runtime=dict(method=a.method,samples=processed,blocks=blocks,audio_seconds=audio_seconds,
+        mfa_repair_scope=a.mfa_repair_scope,mfa_seam_policy=a.mfa_seam_policy,mfa_sentence_fallback=a.mfa_sentence_fallback,
         prediction_format=FORMAT,
         seconds=time.perf_counter()-started,setup_seconds=setup_seconds,phases=dict(phase_seconds),routes=dict(route_counts),
         failures=failures,block_size=a.block_size,batch_size=a.batch_size,input=str(a.input.resolve()),device=a.device,

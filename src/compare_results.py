@@ -1,6 +1,7 @@
 """Compare the paired runs and write a reproducible Chinese experiment report."""
 import argparse
 import json
+import math
 from pathlib import Path
 
 
@@ -13,10 +14,17 @@ def read_predictions(directory):
     return read_rows(path if path.exists() else directory / 'predictions.jsonl')
 
 
-def validate_repairs(base, final, repairs, unresolved, source='mfa'):
+def validate_repairs(base, final, repairs, unresolved, source='mfa', cross_chunk_seams=None):
+    import sys
+    fa_path=str(Path(__file__).resolve().parent/'qwen3-fa')
+    if fa_path not in sys.path:sys.path.insert(0,fa_path)
+    from bounded_seams import splice_bounded, adjust_run, valid
     baseline = {r['id']:r for r in base}
     predicted = {r['id']:r for r in final}
     changed = {r['id']:set() for r in base}
+    replayed = {r['id']:[dict(w) for w in r['words']] for r in base}
+    midpoint_seams = 0
+    bounded_edits = 0
     accepted = rejected = 0
     for repair in repairs:
         ident = repair['id']
@@ -25,10 +33,38 @@ def validate_repairs(base, final, repairs, unresolved, source='mfa'):
         assert all(s in baseline[ident]['sentences'] for s in repair['sentences'])
         assert start == repair['sentences'][0]['start_index']
         assert end == repair['sentences'][-1]['end_index']
-        actual = predicted[ident]['words'][start:end]
+        actual = replayed[ident][start:end]
         if repair['status'] == 'repaired':
             accepted += 1
-            assert actual == repair['replacement_words']
+            actual = repair['replacement_words']
+            bounded = repair['boundary_limits'].get('policy') == 'bounded'
+            if bounded:
+                row=baseline[ident]
+                expected,bounds=splice_bounded(replayed[ident],start,end,actual,
+                    row['chunk_start'],row['chunk_end'],row['words'])
+                assert bounds == repair['boundary_limits']
+                replayed[ident]=expected
+                for adjustment in bounds['adjustments']:
+                    changed[ident].add(adjustment['neighbor_index'])
+                    bounded_edits+=1
+            replayed[ident][start:end] = [dict(w) for w in actual]
+            for adjustment in ([] if bounded else repair['boundary_limits'].get('adjustments', [])):
+                assert repair['boundary_limits']['policy'] == 'midpoint'
+                index = adjustment['neighbor_index']
+                assert index == (start-1 if adjustment['side'] == 'left' else end)
+                endpoint = 'end' if adjustment['side']=='left' else 'start'
+                assert adjustment['endpoint'] == endpoint
+                before, after = adjustment['before_neighbor'], adjustment['after_neighbor']
+                assert replayed[ident][index] == before
+                midpoint = (adjustment['original_neighbor_endpoint']+adjustment['original_replacement_endpoint'])/2
+                assert math.isclose(after[endpoint], midpoint, abs_tol=1e-12)
+                assert after == dict(before, **{endpoint:midpoint})
+                assert after['start'] < after['end']
+                touching = actual[0]['start'] if endpoint=='end' else actual[-1]['end']
+                assert math.isclose(touching,midpoint,abs_tol=1e-12)
+                replayed[ident][index] = dict(after)
+                changed[ident].add(index)
+                midpoint_seams += 1
             left, right = repair['boundary_limits']['left'], repair['boundary_limits']['right']
             previous_end = left
             for word in actual:
@@ -39,8 +75,51 @@ def validate_repairs(base, final, repairs, unresolved, source='mfa'):
             changed[ident].update(range(start,end))
         else:
             rejected += 1
-            assert actual == baseline[ident]['words'][start:end]
+            for index in range(start,end):
+                if index not in changed[ident]:
+                    assert replayed[ident][index] == baseline[ident]['words'][index]
+    cross_chunk_seams=cross_chunk_seams or []
+    for seam in cross_chunk_seams:
+        lid,rid=seam['left_id'],seam['right_id']
+        lrow,rrow=baseline[lid],baseline[rid]
+        assert (lrow.get('source_audio') or lrow['audio'])==(rrow.get('source_audio') or rrow['audio'])
+        assert (lrow.get('channel') or 0)==(rrow.get('channel') or 0)
+        assert lrow['chunk_end']<=rrow['chunk_start']+1e-7
+        if seam.get('policy')=='bounded':
+            qid,mid=seam['qwen_id'],seam['mfa_id']
+            assert {qid,mid}=={lid,rid}
+            side='left' if qid==lid else 'right'
+            a,b=replayed[lid][-1],replayed[rid][0]
+            assert {a.get('source'),b.get('source')}=={'qwen','mfa'}
+            assert (a if qid==lid else b)['source']=='qwen'
+            assert a['end']>b['start']+1e-7
+            original=baseline[qid]
+            indices=range(len(replayed[qid])-1,-1,-1) if side=='left' else range(len(replayed[qid]))
+            edits=adjust_run(replayed[qid],original['words'],indices,side,
+                b['start'] if side=='left' else a['end'],original['chunk_start'],original['chunk_end'])
+            assert edits==seam['adjustments']
+            touched=[e['neighbor_index'] for e in edits]
+            lo,hi=max(0,min(touched)-1),min(len(replayed[qid]),max(touched)+2)
+            assert valid(replayed[qid][lo:hi],original['chunk_start'],original['chunk_end'])
+            assert replayed[lid][-1]['end']<=replayed[rid][0]['start']+1e-7
+            for edit in edits:changed[qid].add(edit['neighbor_index'])
+            bounded_edits+=len(edits)
+            continue
+        li,ri=seam['left_index'],seam['right_index']
+        assert li==len(replayed[lid])-1 and ri==0
+        left,right=replayed[lid][li],replayed[rid][ri]
+        assert left==seam['before_left'] and right==seam['before_right']
+        assert {left.get('source'),right.get('source')}=={'qwen','mfa'}
+        assert left['end']>right['start']+1e-7
+        midpoint=(left['end']+right['start'])/2
+        assert math.isclose(midpoint,seam['midpoint'],abs_tol=1e-12)
+        assert seam['after_left']==dict(left,end=midpoint)
+        assert seam['after_right']==dict(right,start=midpoint)
+        assert midpoint-left['start']>1e-7 and right['end']-midpoint>1e-7
+        replayed[lid][li]=dict(seam['after_left']);replayed[rid][ri]=dict(seam['after_right'])
+        changed[lid].add(li);changed[rid].add(ri)
     for ident, row in baseline.items():
+        assert replayed[ident] == predicted[ident]['words']
         assert len(row['words']) == len(predicted[ident]['words'])
         for i,(old,new) in enumerate(zip(row['words'],predicted[ident]['words'])):
             assert old['text'] == new['text']
@@ -52,7 +131,9 @@ def validate_repairs(base, final, repairs, unresolved, source='mfa'):
         r['task_id'] for r in unresolved['rejected_sentences'] if 'task_id' in r}
     return dict(status='passed', chunks=len(base), sentence_groups=len(repairs),
                 accepted_groups=accepted, rejected_groups=rejected,
-                whole_sentence_replacement=True, unchanged_neighbors=True,
+                whole_sentence_replacement=True, unchanged_neighbors=midpoint_seams+len(cross_chunk_seams)+bounded_edits==0,
+                audited_bounded_neighbor_edits=bounded_edits,
+                audited_midpoint_seams=midpoint_seams+sum(s.get('policy')!='bounded' for s in cross_chunk_seams),audited_cross_chunk_seams=len(cross_chunk_seams),
                 accepted_intervals_positive_and_bounded=True, unchanged_text_and_token_count=True,
                 unresolved_coverage_complete=True)
 
@@ -76,7 +157,9 @@ def main():
     before, after = errors[0]['after'], errors[1]['after']
     repair = errors[1]['repair']
     repairs = read_rows(args.hybrid/'mfa/repairs.jsonl')
-    validation = validate_repairs(base, hybrid, repairs, json.loads((args.hybrid/'unresolved.json').read_text()))
+    seams=args.hybrid/'mfa/cross_chunk_seams.jsonl'
+    validation = validate_repairs(base, hybrid, repairs, json.loads((args.hybrid/'unresolved.json').read_text()),
+                                  cross_chunk_seams=read_rows(seams) if seams.exists() else [])
     (args.baseline.parent/'validation.json').write_text(json.dumps(validation,ensure_ascii=False,indent=2)+'\n')
     valid = [r for r in repairs if r['status']=='repaired']
     if not valid:

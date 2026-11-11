@@ -14,6 +14,9 @@ from sentences import sentence_spans
 from prediction_format import FORMAT, chunk_prediction, export_json, write_predictions
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT / 'src') not in sys.path:
+    sys.path.insert(0, str(ROOT / 'src'))
+from complex_handling import ComplexHandler, add_arguments as add_complex_arguments
 
 
 def word_issues(words, start, end, epsilon=1e-7):
@@ -26,6 +29,7 @@ def word_issues(words, start, end, epsilon=1e-7):
         if not (math.isfinite(a) and math.isfinite(b)):
             reasons.append('nonfinite')
         else:
+            # 判定0时长在这里
             if abs(b - a) <= epsilon:
                 reasons.append('zero_duration')
             elif b < a:
@@ -78,6 +82,11 @@ def load_rows(path):
         row.setdefault('id', f'row:{i}')
         audio = Path(row['audio'])
         row['audio'] = str(audio if audio.is_absolute() else (path.parent / audio).resolve())
+        if row.get('risk_audio'):
+            risk = dict(row['risk_audio'])
+            original = Path(risk['path'])
+            risk['path'] = str(original if original.is_absolute() else (path.parent / original).resolve())
+            row['risk_audio'] = risk
         actual = float(sf.info(row['audio']).duration)
         row.setdefault('duration', actual)
         row.setdefault('chunk_start', 0.0)
@@ -104,6 +113,7 @@ def parser():
     p.add_argument('--language', default='English')
     p.add_argument('--export-unit', choices=['chunk', 'audio', 'both'],
                    help='Also save individual JSON files; existing JSONL/audit outputs are retained')
+    add_complex_arguments(p)
     return p
 
 
@@ -112,6 +122,7 @@ def run(args, repair_factory=None):
     method = getattr(args, 'method', 'qwen+mfa' if repair_factory else 'qwen')
     if args.batch_size < 1:
         raise ValueError('--batch-size must be positive')
+    complex_handler = ComplexHandler.from_args(args)
     rows = load_rows(args.input)
     args.output.mkdir(parents=True, exist_ok=False)
     aligner = QwenAligner(args.checkpoint, device=args.device, backend=args.backend, language=args.language)
@@ -150,6 +161,8 @@ def run(args, repair_factory=None):
             value = dict(row, words=[dict(w, source='qwen') for w in words], language=language,
                          backend=args.backend, method=method,
                          sentences=sentence_spans(row['text'], language, aligner.model.aligner_processor))
+            if complex_handler:
+                value['input_language'] = row.get('input_language', row.get('language'))
             error = next((f['error'] for f in failures if f['id'] == row['id']), None)
             if error:
                 value['error'] = error
@@ -158,17 +171,25 @@ def run(args, repair_factory=None):
     qwen_finished = time.perf_counter()
     before = audit(predictions)
     write_jsonl(args.output / 'qwen_predictions.jsonl', predictions)
+    if complex_handler:
+        complex_handler.prepare(predictions)
     repair_stats = {}
+    repair = None
     if repair_factory:
         repair = repair_factory(args, aligner)
         repair_stats = repair.repair(predictions)
     after = audit(predictions)
+    complex_stats = None
+    if complex_handler:
+        complex_stats = complex_handler.run(predictions, args.output, aligner=aligner, args=args,
+                                            nyra_engine=repair if hasattr(repair, 'shadow_candidate') else None)
     serialization = write_predictions(args.output, predictions)
     if getattr(args, 'export_unit', None):
         exported = export_json(args.output, (chunk_prediction(row) for row in predictions), args.export_unit)
         serialization['json_exports'] = exported['file_counts']
     write_jsonl(args.output / 'failures.jsonl', failures)
-    write_json(args.output / 'error_stats.json', dict(before=before, after=after, repair=repair_stats))
+    write_json(args.output / 'error_stats.json', dict(before=before, after=after, repair=repair_stats,
+                                                    complex_handling=complex_stats))
     if not repair_factory:
         write_json(args.output / 'unresolved.json', [dict(id=r['id'], audio=r['audio'], issues=r['issues'],
                     error=r.get('error')) for r in predictions if r['issues'] or r.get('error')])
@@ -181,10 +202,16 @@ def run(args, repair_factory=None):
         timestamp_unit='seconds', timestamp_origin='selected audio segment start',
         audit_file='alignment_predictions.jsonl', audit_timestamp_origin='source recording',
         zero_epsilon=1e-7, python=sys.executable,
+        complex_handling=complex_stats,
+        mfa_repair_scope=getattr(args,'mfa_repair_scope',None),
+        mfa_seam_policy=getattr(args,'mfa_seam_policy',None),
+        mfa_sentence_fallback=getattr(args,'mfa_sentence_fallback',None),
         gpu_name=aligner.torch.cuda.get_device_name() if args.device.startswith('cuda') else None))
     elapsed = time.perf_counter() - started
     duration = sum(r['duration'] for r in rows)
     additional_load = repair_stats.get('nyra_model_load_seconds', 0.0)
+    if complex_stats:
+        additional_load += complex_stats['nyra_model_load_seconds']
     runtime = dict(method=method, samples=len(rows),
         audio_seconds=duration, device=args.device, seconds=elapsed,
         setup_seconds=loaded-started, qwen_seconds=qwen_finished-loaded,

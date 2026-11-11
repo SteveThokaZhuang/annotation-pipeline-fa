@@ -17,14 +17,20 @@ def canonical(item, source):
     end=int(c.get('end_sample',round(c['end']*sr)))
     if sr<=0 or start<0 or end<=start:
         raise ValueError('Invalid source sample bounds: '+str(c.get('id')))
-    language=next((h.get('language') for h in (item.get('hypotheses') or [])
-                   if isinstance(h,dict) and h.get('language')), 'English')
+    input_language=next((h.get('language') for h in (item.get('hypotheses') or [])
+                         if isinstance(h,dict) and h.get('language')), None)
+    language=input_language or 'English'
     return dict(id=c['id'],audio=c.get('audio_path') or c['path'],source_audio=c.get('audio_path') or c['path'],
                 audio_scope='recording',text=item.get('text',''),language=language,
                 recording_id=c['recording_id'],channel=int(c.get('channel',0)),
                 source_sample_rate=sr,start_sample=start,end_sample=end,
                 chunk_start=start/sr,chunk_end=end/sr,duration=(end-start)/sr,
-                source_json=str(source),rover_signature=(item.get('_provenance') or {}).get('signature'))
+                source_json=str(source),rover_signature=(item.get('_provenance') or {}).get('signature'),
+                input_language=input_language,
+                risk_audio=dict(path=c['path'], sample_rate=sr, start_sample=start, end_sample=end,
+                                channel=int(c.get('channel',0))) if c.get('path') else None,
+                hypotheses=[{k:h[k] for k in ('text','language','source_result') if k in h}
+                            for h in (item.get('hypotheses') or []) if isinstance(h,dict)])
 
 
 def main():

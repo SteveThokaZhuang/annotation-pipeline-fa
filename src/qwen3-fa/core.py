@@ -40,6 +40,14 @@ def expand_rows(rows):
                        audio=audio, text=text, duration=max(0.0, end - start),
                        chunk_start=start, chunk_end=end, recording_id=chunk.get('recording_id', recording.get('recording_channel')),
                        channel=chunk.get('channel'), source_recording=recording.get('recording_channel', recording.get('id')))
+            for name in ('language', 'input_language', 'language_verified', 'hypotheses', 'dnsmos',
+                         'complex_evidence', 'risk_audio', 'target_isolated'):
+                if name in item:
+                    row[name] = item[name]
+                elif name in chunk:
+                    row[name] = chunk[name]
+                elif name in ('language', 'input_language', 'language_verified') and name in recording:
+                    row[name] = recording[name]
             out.append(row)
     if len({row['id'] for row in out}) != len(out):
         raise ValueError('Duplicate input ids')

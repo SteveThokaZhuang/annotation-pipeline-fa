@@ -85,7 +85,8 @@ def main():
     plain_mfa=data['qwen3-fa+mfa']
     directory=args.root/'qwen3-fa+mfa'
     validation['qwen+mfa']=validate_repairs(baseline['rows'],plain_mfa['rows'],
-        read_rows(directory/'mfa/repairs.jsonl'),read(directory/'unresolved.json'))
+        read_rows(directory/'mfa/repairs.jsonl'),read(directory/'unresolved.json'),
+        cross_chunk_seams=read_rows(directory/'mfa/cross_chunk_seams.jsonl') if (directory/'mfa/cross_chunk_seams.jsonl').exists() else [])
     direct=data['qwen3-fa+nyra']
     directory=args.root/'qwen3-fa+nyra'
     direct_records=read_rows(directory/'nyra/repairs.jsonl')
@@ -96,7 +97,8 @@ def main():
     intermediate=read_rows(directory/'mfa_predictions.jsonl')
     assert [r['words'] for r in intermediate]==[r['words'] for r in plain_mfa['rows']], 'MFA stages differ'
     validation['cascade_mfa']=validate_repairs(baseline['rows'],intermediate,
-        read_rows(directory/'mfa/repairs.jsonl'),read(directory/'mfa/unresolved.json'))
+        read_rows(directory/'mfa/repairs.jsonl'),read(directory/'mfa/unresolved.json'),
+        cross_chunk_seams=read_rows(directory/'mfa/cross_chunk_seams.jsonl') if (directory/'mfa/cross_chunk_seams.jsonl').exists() else [])
     cascade_records=read_rows(directory/'nyra/repairs.jsonl')
     validation['cascade_nyra']=validate_repairs(intermediate,cascade['rows'],cascade_records,
         read(directory/'unresolved.json'),source='nyra')

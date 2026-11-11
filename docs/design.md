@@ -1,6 +1,42 @@
-# Qwen FA 与整句 MFA 回退实现
+# Qwen FA 与 MFA 回退实现
 
-最终策略：对 Qwen 每个输出字词判断时长；只要某个字词 `abs(end-start) <= 1e-7`，就将它所在的**完整句子全部交给 MFA**。只有整句的 MFA 输出及替换边界都合法，才替换该句全部字词。失败保留原结果并在独立 JSON 记录。
+## 有预算的邻词调整（2026-11-11 smoke 方案）
+
+新策略通过 `--mfa-seam-policy bounded` 显式启用，整 chunk 优先与句级 fallback 的顺序不变。原 midpoint/clamp 可用于对照，当前默认仍为 midpoint，尚未用 smoke 结果替换全量交付数据。
+
+- MFA 原始时间戳保持不动，不截断或取中点。每个 Qwen 起止端点相对最初 Qwen 的绝对位移最多 **20 ms**；单词时长至少保留原时长的 **90%**。这两个数是工程实验参数，不是“人耳无法感知”的保证。
+- 先利用已有词间空隙；发生重叠时，先缩短紧邻 Qwen 词的接触端点，若超过该词 10% 的压缩预算，再平移另一端点，必要时向外逐词传播。遇到空隙就停止，窗口不预设词数。多个词的压缩不会增加接触端点自己的 20 ms 预算。
+- 被调整的词必须是原始、当前均为正时长且有限的 Qwen 词，不能碰零时长词或之前已接受的 MFA 词。允许修正 Qwen 原有的轻微 chunk 越界，但调整后被触及区间必须在所属 chunk 内。其余既有错误不因该规则自动修复。
+- 每次候选替换在副本上处理；任一端预算不足、越界、词塌缩或产生重叠，整次替换拒绝，无部分修改。MFA 自身不合法或分词不一致同样拒绝。
+- 同录音、同声道的跨 chunk 接缝应用同样预算，保留 MFA，只调整 Qwen。若无法容纳，恢复产生该接缝的 MFA chunk 为原始 Qwen，再从未做跨 chunk 调整的候选快照重新处理，避免遗留邻词修改。上游音频窗口本身重叠也拒绝。仅保证传入批次内的接缝；全量合并需传入全部相邻 chunk，不能把单个 streaming 批次当成全局校验。
+- `boundary_limits.adjustments` 保存原始 Qwen、调整前后词、端点位移、时长压缩和参数；跨 chunk 审计仍在 `mfa/cross_chunk_seams.jsonl`、`cross_chunk_rejected.jsonl`。跨 chunk 回退的候选保存在 `rolled_back_attempt`。`compare_results.validate_repairs` 按最初 Qwen 与审计重放校验。
+
+实现：`src/qwen3-fa/bounded_seams.py`。CPU 回放 smoke：
+
+```bash
+CUDA_VISIBLE_DEVICES='' /mnt/data/L202500293/obed/envs/qwenasr/bin/python \
+  src/smoke_bounded_replacement.py --output /tmp/fa_bounded_smoke_20261111
+CUDA_VISIBLE_DEVICES='' /mnt/data/L202500293/obed/envs/qwenasr/bin/python \
+  src/smoke_bounded_cpu_mfa.py --replay /tmp/fa_bounded_smoke_20261111
+```
+
+回放取前 256 个原始零时长 chunk、上一轮全部已知中点接缝案例及相邻上下文，额外上下文中的零时长 chunk 也处理；这是压力抽样，不是随机代表性评估。比较句级 midpoint、句级 bounded、整 chunk 优先再句级 midpoint/bounded；各方案均完成样本内跨 chunk 接缝处理。随后取 5 个普通案例与全部已知句内接缝案例，实际在 CPU 重新运行 MFA，分别覆盖 chunk 优先与句级入口。结果保存精确输入、候选、参数、命令、CPU 环境、模型与代码 SHA-256、逐词修改、拒绝原因和校验结果。大文件在本机 `/tmp`，小型汇总另保存在共享 `results/open_yap_1k_summary/`。
+
+最终 smoke 对照已经统一为**各方案均完成样本内跨 chunk 接缝处理**。样本共 559 个 chunk、12,902 个词，其中 323 个 chunk 原始含零时长词。原始零时长词 708；句级中点剩 2，句级 bounded 剩 42，整 chunk＋中点剩 2，整 chunk＋bounded 剩 34。新整 chunk 方案的 28 个跨 chunk 接缝接受 11、回退 17；正常 Qwen 端点最大移动 20 ms、最大时长压缩 6.25%。整 chunk＋中点对照最大移动约 117.5 ms、最大压缩 28.125%。这些量是相对原始 Qwen 的改动，并非相对人工真值的误差。新方案减少对正常词的大幅修改，代价是保留更多零时长词，不能据此声称准确率提高。
+
+实际 CPU MFA 重跑的 8 个 chunk 原始有 16 个零时长词；整 chunk 优先全部修好，句级入口有 4 个句组超出 20 ms 预算而回退，剩 8 个零时长词。两入口 MFA 退出码均 0，审计重放通过；89 项回归测试通过。真实样本尚未展示成功的多词连锁传播，连锁传播由定向测试验证。最新完整记录：`results/open_yap_bounded_smoke/`（本机目录链接）；共享摘要：`results/open_yap_1k_summary/bounded_smoke_20261111.json`。没有进行人工听审，也没有替换上一轮全量标注。
+
+## 中点方案与历史实现
+
+当前 MFA 入口及 streaming worker 默认采用 **整 chunk MFA 优先 → 失败时句级 MFA＋中点接缝 → 两级失败时保留原 Qwen**，含 Nyra 级联中的 MFA 阶段。触发条件仍为任意字词 `abs(end-start) <= 1e-7`；无零时长 chunk 仅允许邻接 Qwen/MFA 接缝所需的已审计端点调整。整 chunk 使用上游完整音频区间和原转写，不按 Qwen 时间戳裁音频。任何替换均需文本覆盖、词单元一致、正时长、单调、不重叠且不越界；禁止为分词不一致的区间均分时长。
+
+句级替换只对发生重叠的左右接缝取中点，并同时修改两个相邻词的接触端点。例如前词结束 1.20、后词开始 1.15，统一成 1.175；原本的间隙保留。若调整导致词区间塌缩，则整次替换拒绝。完整原值、新值、涉及词索引保存在 `boundary_limits.adjustments`；`compare_results.validate_repairs` 按记录重放，拒绝未审计的邻词改动。
+
+同一录音同一声道的相邻 chunk 若在 Qwen/MFA 接触词上重叠，也按同一中点规则调整。它可能缩短原本已越界的 Qwen 邻词；不改变 chunk 的上游采样区间。审计为 `mfa/cross_chunk_seams.jsonl`，无法安全调整者记录为 `cross_chunk_rejected.jsonl`。实际音频区间相互重叠的上游窗口不按词接缝处理，避免擅自去重。MFA 批内调用会处理当前批；离线最终合并通过 `seams.reconcile_stream` 进一步处理跨输出分块的接缝。MAE 对比明确标为各 chunk 替换后、跨 chunk 接缝统一前；最终交付的标注则已完成跨 chunk 统一。
+
+参数：`--mfa-repair-scope chunk|sentence`（默认 chunk）、`--mfa-seam-policy midpoint|clamp`（默认 midpoint）、`--no-mfa-sentence-fallback`（仅做整 chunk 尝试，失败保留 Qwen）。复现下文历史句级截断实验时，Qwen＋MFA 入口显式传 `--mfa-repair-scope sentence --mfa-seam-policy clamp`。原整块尝试记录存 `mfa/chunk_attempts.jsonl`，句级回退的原始输入、结果、拒绝原因在 `mfa/sentence_fallback/`；主 `mfa/repairs.jsonl` 描述最终生效的替换。Streaming 归档同样保存两阶段审计和原始 MFA 对齐。
+
+Open YAP 离线验证入口：`replay_mfa_midpoint.py` 重放原句级 MFA 候选；`run_rover_zero_chunk_mfa.py` 对全部原 Qwen 零时长 chunk 跑 CPU MFA；`finalize_rover_replacements.py` 比较旧句级、中点句级、纯整块和整块优先＋句级回退，导出完整结果及待人工听审样本；`verify_rover_replacements.py` 独立核查输出。全部复用已有 Qwen 文件，不加载 Qwen 模型，启动时设置 `CUDA_VISIBLE_DEVICES=''`。结果为 `results/open_yap_midpoint_chunk/`，以 `comparison.json` 的 `complete` 及 `validation.json` 为完成回执。
 
 ## 入口与复用
 
@@ -8,14 +44,14 @@
 - `src/qwen3-fa/core.py`：复用现有 Qwen 模型加载、public/native 后端和录音时间偏移；修正空批次返回结构、缺省 ID 和空语言字段。新增 `strict=False` 让 process 保留原始异常作逐词统计，原有调用默认仍严格校验。
 - `src/qwen3-fa/process.py`：公共运行流程、单条失败隔离、逐字词校验、错误率、RTF 和输出。
 - `src/qwen3-fa/sentences.py`：按 ASR 句末标点划句，再使用同一 Qwen tokenizer 验证词元覆盖；若拆句改变分词，保守地把整个 ASR chunk 当上下文，避免猜测索引。
-- `src/qwen3-fa+mfa/process.py`、`repair.py`：独立加载 Qwen 后执行整句 MFA 回退。
+- `src/qwen3-fa+mfa/process.py`、`repair.py`：独立加载 Qwen 后执行整 chunk 优先的两级 MFA 回退。
 - `src/prepare_candor.py`：只复用已有 ASR，读取指定原始 MP3，统一为 16 kHz 单声道 PCM 切片。
 - `src/setup_mfa_models.py`：从官方 `MontrealCorpusTools/english_us_arpa` 仓库下载固定 revision 的声学模型和配套词典，保存来源与文件 SHA-256。
 - `src/compare_results.py`：校验两次 Qwen 原始输出完全一致，生成比较 JSON、两份实际例子和实验记录。
 
 没有重跑 ASR。已有 `annotation_pipeline` 的源代码、标注和录音不修改。
 
-## 整句回退步骤
+## 原句级截断回退步骤（历史对照）
 
 1. 先完成 Qwen process，保存 `qwen_predictions.jsonl`；逐字词检查零时长、负时长、非有限值、越界、时间倒退、重叠，保留真实异常，不用最小时长填充。
 2. 将零时长词映射到完整 ASR 句子。一个句子多个坏词只回退一次；相邻触发句合并为一个包含完整句子的区域，一起对齐，避免在连续坏区之间制造边界。
